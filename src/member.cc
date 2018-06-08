@@ -30,6 +30,8 @@ extern "C" {
 
 Timer timer;
 
+const static int64_t kMaxInt64 = (1 << 63) - 1;
+
 extern "C" {
 aeEventLoop* getEventLoop();
 }
@@ -47,7 +49,7 @@ namespace {
 
 int DoFlush(RedisModuleCtx* ctx, int64_t sn_left, int64_t sn_right,
             int64_t sn_ckpt, const std::vector<std::string>& flushable_keys) {
-  CHECK(module.gcs_mode() == RedisChainModule::GcsMode::kCkptFlush);
+  CHECK(module.SupportsFlushing());
 
   const int64_t old = module.key_to_sn().size();
 
@@ -59,6 +61,9 @@ int DoFlush(RedisModuleCtx* ctx, int64_t sn_left, int64_t sn_right,
     CHECK(REDISMODULE_OK == RedisModule_DeleteKey(rmkey));
     RedisModule_CloseKey(rmkey);
     RedisModule_FreeString(ctx, rms);
+
+    // Clean up key_to_sn.
+    module.key_to_sn().erase(key);
 
     // NOTE(zongheng): DEL seems to have some weird issues.  See below.
     // RedisModuleCallReply* reply =
@@ -92,9 +97,6 @@ int DoFlush(RedisModuleCtx* ctx, int64_t sn_left, int64_t sn_right,
 
     //   DLOG(INFO) << "  GET " << key << ": " << std::string(ptr, len);
     // }
-
-    // Clean up key_to_sn.
-    module.key_to_sn().erase(key);
   }
 
   const int64_t diff = old - module.key_to_sn().size();
@@ -129,6 +131,8 @@ int DoFlush(RedisModuleCtx* ctx, int64_t sn_left, int64_t sn_right,
 // w.r.t. sn_ckpt.
 void CollectFlushableKeys(int64_t sn_left, int64_t sn_right, int64_t sn_ckpt,
                           std::vector<std::string>* flushable_keys) {
+  DLOG(INFO) << "sn_left " << sn_left << " sn_right " << sn_right << " sn_ckpt "
+             << sn_ckpt;
   const auto& sn_to_key = module.sn_to_key();
   const auto& key_to_sn = module.key_to_sn();
 
@@ -138,24 +142,19 @@ void CollectFlushableKeys(int64_t sn_left, int64_t sn_right, int64_t sn_ckpt,
     const std::string& key_str(it->second);
     const auto it_keytosn = key_to_sn.find(key_str);
 
-    if (it_keytosn == key_to_sn.end()) {
-      VLOG(2) << "key_to_sn has no record of key '" << key_str << "'";
-      // It's already flushed.  DoFlush() below simply removes this sn_to_key
-      // entry down the chain.
-    } else if (it_keytosn->second < sn_ckpt) {
-      VLOG(2) << "key_to_sn recorded key '" << key_str
-              << "' with its latest sn " << it_keytosn->second;
-      // Key is not dirty with respect to the checkpoint watermark: flushable.
-      // The comparison is < not <=, since "sn_ckpt" points to smallest _yet_
-      // to be checkpointed seqnum.
-      flushable_keys->push_back(std::move(key_str));
-    } else {
+    if (it_keytosn != key_to_sn.end() && it_keytosn->second >= sn_ckpt) {
       // Key is dirty, will be flushed later.
+    } else {
+      // Key is not dirty with respect to the checkpoint watermark:
+      // flushable. The comparison is < not <=, since "sn_ckpt" points to
+      // smallest _yet_ to be checkpointed seqnum.
+      flushable_keys->push_back(std::move(key_str));
     }
   }
   DLOG(INFO) << " #flushable_keys " << flushable_keys->size();
 }
 
+// TODO(zongheng): unify this with RedisChainModule::MutateHelper().
 // Helper function to handle updates locally.
 //
 // For all nodes: (1) actual update into redis, (1) update the internal
@@ -181,6 +180,8 @@ int Put(RedisModuleCtx* ctx, RedisModuleString* name, RedisModuleString* data,
   // NOTE(zongheng): this can be slow, see the note in class declaration.
   module.sn_to_key()[sn] = key_str;
   if (module.gcs_mode() == RedisChainModule::GcsMode::kCkptFlush) {
+    // We only record this when both ckpt and flush are turned on, to avoid
+    // dirtiness issues.  For kFlushOnlyUnsafe, there's no need to record.
     module.key_to_sn()[key_str] = sn;
   }
   module.record_sn(static_cast<int64_t>(sn));
@@ -678,9 +679,9 @@ int TailCheckpoint_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
     return RedisModule_ReplyWithError(
         ctx, "ERR this command must be called on the tail.");
   }
-  if (module.gcs_mode() == RedisChainModule::GcsMode::kNormal) {
+  if (!module.SupportsCheckpointing()) {
     return RedisModule_ReplyWithError(
-        ctx, "ERR redis server's GcsMode is set to kNormal.");
+        ctx, "ERR GcsMode indicates no checkpointing support");
   }
 
   // TODO(zongheng): the following checkpoints the range [sn_ckpt, sn_latest],
@@ -755,27 +756,34 @@ int HeadFlush_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
     return RedisModule_ReplyWithError(
         ctx, "ERR this command must be called on the head.");
   }
-  if (module.gcs_mode() != RedisChainModule::GcsMode::kCkptFlush) {
+  if (!module.SupportsFlushing()) {
     return RedisModule_ReplyWithError(
-        ctx, "ERR redis server's GcsMode is NOT set to kCkptFlush.");
+        ctx, "ERR GcsMode indicates no flushing support");
   }
 
   // Read watermarks from master.
   // Clearly, we can provide a batch iface.
   int64_t sn_ckpt = 0, sn_flushed = 0;
-  HandleNonOk(ctx, module.Master()->GetWatermark(
-                       MasterClient::Watermark::kSnCkpt, &sn_ckpt));
+  if (module.gcs_mode() == RedisChainModule::GcsMode::kFlushOnlyUnsafe) {
+    sn_ckpt = kMaxInt64;
+  } else {
+    HandleNonOk(ctx, module.Master()->GetWatermark(
+                         MasterClient::Watermark::kSnCkpt, &sn_ckpt));
+  }
   HandleNonOk(ctx, module.Master()->GetWatermark(
                        MasterClient::Watermark::kSnFlushed, &sn_flushed));
   DLOG(INFO) << "sn_flushed " << sn_flushed << " sn_ckpt " << sn_ckpt;
 
   // Any non-dirty keys in the range [sn_flushed, sn_ckpt) may be flushed.
-
-  const int64_t sn_bound =
-      std::min(sn_flushed + kMaxEntriesToFlushOnce, sn_ckpt);
+  // Additionally we take into account (1) reasonably-sized batch, (2) max
+  // seqnum seen.
+  // In summary, the eligible range is [sn_flushed, sn_bound).
+  const int64_t sn_bound = std::min(
+      module.sn() + 1, std::min(sn_flushed + kMaxEntriesToFlushOnce, sn_ckpt));
   std::vector<std::string> flushable_keys;
   CollectFlushableKeys(sn_flushed, sn_bound, sn_ckpt, &flushable_keys);
 
+  // DoFlush() sends a reply to the client.
   int result = DoFlush(ctx, /*sn_left*/ sn_flushed, /*sn_right*/ sn_bound,
                        /*sn_ckpt*/ sn_ckpt, flushable_keys);
   const double end = timer.NowMicrosecs();
@@ -848,7 +856,7 @@ int Read_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv, int argc) {
     size_t size = 0;
     const char* value = reader.value(&size);
     return RedisModule_ReplyWithStringBuffer(ctx, value, size);
-  } else if (module.gcs_mode() > RedisChainModule::GcsMode::kNormal) {
+  } else if (module.SupportsCheckpointing()) {
     // Fall back to checkpoint file.
     leveldb::DB* ckpt;
     Status s = module.OpenCheckpoint(&ckpt);
@@ -914,6 +922,9 @@ int RedisModule_OnLoad(RedisModuleCtx* ctx, RedisModuleString** argv,
       break;
     case 2:
       module.set_gcs_mode(RedisChainModule::GcsMode::kCkptFlush);
+      break;
+    case 3:
+      module.set_gcs_mode(RedisChainModule::GcsMode::kFlushOnlyUnsafe);
       break;
     default:
       return REDISMODULE_ERR;

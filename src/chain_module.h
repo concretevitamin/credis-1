@@ -86,9 +86,11 @@ class RedisChainModule {
     kTail = 3,
   };
   enum class GcsMode : int {
-    kNormal = 0,     // (Default) No checkpointing, no flushing.
-    kCkptOnly = 1,   // Checkpointing on; flushing off.
-    kCkptFlush = 2,  // Both checkpointing & flushing on.
+    kNormal = 0,           // (Default) No checkpointing, no flushing.
+    kCkptOnly = 1,         // Checkpointing on; flushing off.
+    kCkptFlush = 2,        // Both checkpointing & flushing on.
+    kFlushOnlyUnsafe = 3,  // Support for flushing only.  Since checkpointing is
+                           // explicitly turned off, this is an unsafe option.
   };
   enum class MasterMode : int {
     kRedis = 0,  // redis-based master.
@@ -122,9 +124,19 @@ class RedisChainModule {
         return "kCkptOnly";
       case GcsMode::kCkptFlush:
         return "kCkptFlush";
+      case GcsMode::kFlushOnlyUnsafe:
+        return "kFlushOnlyUnsafe";
       default:
         CHECK(false);
     }
+  }
+  bool SupportsFlushing() const {
+    return gcs_mode() == GcsMode::kCkptFlush ||
+           gcs_mode() == GcsMode::kFlushOnlyUnsafe;
+  }
+  bool SupportsCheckpointing() const {
+    return gcs_mode() == GcsMode::kCkptFlush ||
+           gcs_mode() == GcsMode::kCkptOnly;
   }
 
   MasterMode master_mode() const {
@@ -341,6 +353,8 @@ int RedisChainModule::MutateHelper(RedisModuleCtx* ctx,
   // NOTE(zongheng): this can be slow, see the note in class declaration.
   sn_to_key()[sn] = key_str;
   if (gcs_mode() == RedisChainModule::GcsMode::kCkptFlush) {
+    // We only record this when both ckpt and flush are turned on, to avoid
+    // dirtiness issues.  For kFlushOnlyUnsafe, there's no need to record.
     key_to_sn()[key_str] = sn;
   }
   record_sn(static_cast<int64_t>(sn));
