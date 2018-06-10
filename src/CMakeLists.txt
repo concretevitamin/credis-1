@@ -3,6 +3,8 @@ include_directories(${CMAKE_SOURCE_DIR}/redis/src/)
 include_directories(${CMAKE_SOURCE_DIR}/redis/deps/)
 
 find_package(glog 0.3.5 REQUIRED)
+# add_subdirectory(${CMAKE_SOURCE_DIR}/glog)
+
 find_package(LevelDB REQUIRED)
 find_package(Tcmalloc)
 include_directories(${LevelDB_INCLUDES})
@@ -30,6 +32,11 @@ add_library(timer STATIC timer.cc)
 target_compile_options(timer PUBLIC ${REDIS_MODULE_CFLAGS} -fPIC)
 target_link_libraries(timer glog::glog)
 
+# flush_policy
+add_library(flush_policy STATIC flush_policy.cc)
+target_compile_options(flush_policy PUBLIC ${REDIS_MODULE_CFLAGS} -fPIC)
+target_link_libraries(flush_policy glog::glog timer)
+
 # utils
 add_library(utils STATIC utils.cc)
 target_compile_options(utils PUBLIC ${REDIS_MODULE_CFLAGS} -fPIC)
@@ -53,7 +60,7 @@ target_link_libraries(master ${REDIS_MODULE_LDFLAGS})
 target_link_libraries(master utils)
 target_link_libraries(master glog::glog)
 target_link_libraries(master ${LevelDB_LIBRARIES})
-target_link_libraries(master master_client)
+target_link_libraries(master master_client)  # Needed by chain_module.h.
 
 # member
 add_library(member SHARED member.cc)
@@ -63,7 +70,16 @@ target_link_libraries(member utils)
 target_link_libraries(member glog::glog)
 target_link_libraries(member ${LevelDB_LIBRARIES})
 target_link_libraries(member master_client)
-target_link_libraries(member ${MALLOC_LIBRARY} timer)
+target_link_libraries(member ${MALLOC_LIBRARY} timer flush_policy)
+
+# add_library(member_master STATIC member.cc master.cc)
+# target_compile_options(member_master PUBLIC ${REDIS_MODULE_CFLAGS} -fPIC)
+# target_link_libraries(member_master ${REDIS_MODULE_LDFLAGS})
+# target_link_libraries(member_master utils)
+# target_link_libraries(member_master glog::glog)
+# target_link_libraries(member_master ${LevelDB_LIBRARIES})
+# target_link_libraries(member_master master_client)
+# target_link_libraries(member_master ${MALLOC_LIBRARY} timer flush_policy)
 
 # Benchmarks.
 add_executable(credis_parput_bench credis_parput_bench.cc)

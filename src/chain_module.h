@@ -24,11 +24,7 @@ const char* const kCheckpointHeaderKey = "";
 // Register this so that on disconnect, the respective redisAsyncContext will be
 // timely freed by hiredis.  Otherwise non-deterministic crashes happen on next
 // redisAsyncCommand() call.
-void DisconnectCallback(const redisAsyncContext* /*context*/, int /*status*/) {
-  // "context" will be freed by hiredis.  Quote: "The context object is always
-  // freed after the disconnect callback fired."
-}
-void RedisDisconnectCallback(const redisAsyncContext* c, int status) {
+void RedisDisconnectCallback(const redisAsyncContext* c, int /*status*/) {
   // if (status == REDIS_OK) {
   //   // Normal execution, program exit.
   //   //
@@ -59,15 +55,6 @@ redisAsyncContext* AsyncConnect(const std::string& address, int port) {
   CHECK(redisAsyncSetDisconnectCallback(c, &RedisDisconnectCallback) ==
         REDIS_OK);
   return c;
-}
-
-int HandleNonOk(RedisModuleCtx* ctx, Status s) {
-  if (s.ok()) {
-    return REDISMODULE_OK;
-  }
-  LOG(INFO) << s.ToString();
-  RedisModule_ReplyWithSimpleString(ctx, "ERR");
-  return REDISMODULE_ERR;
 }
 
 }  // namespace
@@ -346,7 +333,7 @@ int RedisChainModule::MutateHelper(RedisModuleCtx* ctx,
 
   // State maintenance.
   const std::string key_str = ReadString(redis_key_str);
-  DLOG(INFO) << "Mutated key: " << key_str << "; size: " << key_str.size();
+  // DLOG(INFO) << "Mutated key: " << key_str << "; size: " << key_str.size();
 
   // Update sn_to_key (for all execution modes; used for node addition codepath)
   // and optionally key_to_sn (when flushing is on).

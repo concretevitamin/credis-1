@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <climits>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -22,15 +23,15 @@ extern "C" {
 #include "redis/src/redismodule.h"
 }
 #include "glog/logging.h"
+// #include "glog/utilities.h"
 #include "leveldb/db.h"
 #include "leveldb/write_batch.h"
 
+#include "flush_policy.h"
 #include "timer.h"
 #include "utils.h"
 
-Timer timer;
-
-const static int64_t kMaxInt64 = (1 << 63) - 1;
+const static int64_t kMaxInt64 = LLONG_MAX;
 
 extern "C" {
 aeEventLoop* getEventLoop();
@@ -46,6 +47,15 @@ aeEventLoop* getEventLoop();
 RedisChainModule module;
 
 namespace {
+
+int HandleNonOk(RedisModuleCtx* ctx, Status s) {
+  if (s.ok()) {
+    return REDISMODULE_OK;
+  }
+  LOG(INFO) << s.ToString();
+  RedisModule_ReplyWithSimpleString(ctx, "ERR");
+  return REDISMODULE_ERR;
+}
 
 int DoFlush(RedisModuleCtx* ctx, int64_t sn_left, int64_t sn_right,
             int64_t sn_ckpt, const std::vector<std::string>& flushable_keys) {
@@ -263,7 +273,6 @@ size_t FindFirstOf(char c, size_t pos, const char* str, size_t len) {
   }
   return pos < len ? pos : std::string::npos;
 }
-
 }  // namespace
 
 // Set the role, successor and predecessor of this server.
@@ -359,7 +368,9 @@ int MemberConnectToMaster_RedisCommand(RedisModuleCtx* ctx,
   const char* ptr = RedisModule_StringPtrLen(argv[1], &size);
   long long port = 0;
   RedisModule_StringToLongLong(argv[2], &port);
+  DLOG(INFO) << "Calling ConnectToMaster, port " << port;
   Status s = module.ConnectToMaster(std::string(ptr, size), port);
+  DLOG(INFO) << " " << s.ToString();
   if (!s.ok()) return RedisModule_ReplyWithError(ctx, s.ToString().data());
   return RedisModule_ReplyWithSimpleString(ctx, "OK");
 }
@@ -417,6 +428,7 @@ int MemberPut_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
 
 int NoReply_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
                          int argc) {
+  REDISMODULE_NOT_USED(argv);
   if (argc != 1) {
     return RedisModule_WrongArity(ctx);
   }
@@ -488,7 +500,7 @@ int MemberNoPropPut_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
 // argv[2]: blob; see MemberReplicate_RedisCommand for its schema
 int MemberNoPropBatchedPut_RedisCommand(RedisModuleCtx* ctx,
                                         RedisModuleString** argv, int argc) {
-  const double start = timer.NowMicrosecs();
+  const double start = Timer::NowMicrosecs();
   if (argc != 3) {
     return RedisModule_WrongArity(ctx);
   }
@@ -550,7 +562,7 @@ int MemberNoPropBatchedPut_RedisCommand(RedisModuleCtx* ctx,
     pos = next_pos + 1;
   }
 
-  const double end = timer.NowMicrosecs();
+  const double end = Timer::NowMicrosecs();
   LOG(INFO) << "MemberNoPropBatchedPut took " << (end - start) / 1e3 << " ms";
   return REDISMODULE_OK;
 }
@@ -564,7 +576,9 @@ int MemberNoPropBatchedPut_RedisCommand(RedisModuleCtx* ctx,
 // TODO(zongheng): fix the note above; correct iff synchronous...
 int MemberReplicate_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
                                  int argc) {
-  const double start = timer.NowMicrosecs();
+  REDISMODULE_NOT_USED(argv);
+  REDISMODULE_NOT_USED(argc);
+  const double start = Timer::NowMicrosecs();
   DLOG(INFO) << "has child? " << (module.child() != nullptr);
   // TODO(zongheng): we should cap the size of each send.
   if (module.child() && !module.sn_to_key().empty()) {
@@ -586,7 +600,7 @@ int MemberReplicate_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
     static constexpr int kValSize = 512;
     static constexpr char kSpace = ' ';
     blob.reserve((kKeySize + kValSize) * num_entries);
-    int cnt = 0;
+    size_t cnt = 0;
     // NOTE(zongheng): we basically use "sn_to_key" to iterate through
     // in-memory state for convenience only.  Presumably, we can rely on some
     // other mechanisms, such as redis' native iterator, to do this.
@@ -616,7 +630,7 @@ int MemberReplicate_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
         blob.size());
     CHECK(status == REDIS_OK);
   }
-  const double end = timer.NowMicrosecs();
+  const double end = Timer::NowMicrosecs();
   const int millis = static_cast<int>((end - start) / 1e3);
   LOG(INFO) << "MemberReplicate took " << millis << " ms";
   return RedisModule_ReplyWithLongLong(ctx, millis);
@@ -657,11 +671,8 @@ int MemberUnblockWrites_RedisCommand(RedisModuleCtx* ctx,
   return RedisModule_ReplyWithNull(ctx);
 }
 
-// TODO(zongheng): make these configurable (in current form or otherwise).
+// TODO(zongheng): make configurable (in current form or otherwise).
 const int kMaxEntriesToCkptOnce = 350000;
-const int kMaxEntriesToFlushOnce = 350000;
-// const int kMaxEntriesToCkptOnce = 1 << 30;
-// const int kMaxEntriesToFlushOnce = 1 << 30;
 
 // TAIL.CHECKPOINT: incrementally checkpoint in-memory entries to durable
 // storage.
@@ -670,7 +681,7 @@ const int kMaxEntriesToFlushOnce = 350000;
 // not called on the tail.
 int TailCheckpoint_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
                                 int argc) {
-  const double start = timer.NowMicrosecs();
+  const double start = Timer::NowMicrosecs();
   REDISMODULE_NOT_USED(argv);
   if (argc != 1) {  // No arg needed.
     return RedisModule_WrongArity(ctx);
@@ -736,22 +747,20 @@ int TailCheckpoint_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
 
   const int64_t num_checkpointed = sn_bound - sn_ckpt + 1;
 
-  const double end = timer.NowMicrosecs();
-  LOG(INFO) << "TailCheckpoint took " << (end - start) / 1e3 << " ms";
+  const double end = Timer::NowMicrosecs();
+  DLOG(INFO) << "TailCheckpoint took " << (end - start) / 1e3 << " ms";
 
   return RedisModule_ReplyWithLongLong(ctx, num_checkpointed);
 }
 
-// HEAD.FLUSH: incrementally flush checkpointed entries out of memory.
-//
-// Replies to the client # of keys removed from redis state, including 0.
-//
-// Errors out if not called on the head, or if GcsMode is not kCkptFlush.
-int HeadFlush_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
-                           int argc) {
-  const double start = timer.NowMicrosecs();
-  REDISMODULE_NOT_USED(argv);
-  if (argc != 1) return RedisModule_WrongArity(ctx);  // No args needed.
+static FlushPolicy flush_policy;
+
+// Args:
+//   <flush_when_at_least_bytes>
+//   <flush_period_secs>
+//   <flush_num_entries_each_time>
+int ConfigureFlushPolicy_RedisCommand(RedisModuleCtx* ctx,
+                                      RedisModuleString** argv, int argc) {
   if (!module.ActAsHead()) {
     return RedisModule_ReplyWithError(
         ctx, "ERR this command must be called on the head.");
@@ -759,6 +768,43 @@ int HeadFlush_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
   if (!module.SupportsFlushing()) {
     return RedisModule_ReplyWithError(
         ctx, "ERR GcsMode indicates no flushing support");
+  }
+  if (argc != 4) return RedisModule_WrongArity(ctx);
+  // Policy args.
+  long long flush_when_at_least_bytes = -1;
+  long long flush_period_secs = -1;
+  long long flush_num_entries_each_time = -1;
+  RedisModule_StringToLongLong(argv[1], &flush_when_at_least_bytes);
+  RedisModule_StringToLongLong(argv[2], &flush_period_secs);
+  RedisModule_StringToLongLong(argv[3], &flush_num_entries_each_time);
+
+  flush_policy.SetPolicy(flush_when_at_least_bytes, flush_period_secs,
+                         flush_num_entries_each_time);
+  return RedisModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+// HEAD.FLUSH: incrementally flush checkpointed entries out of memory.
+// Args: <max_num_entries_to_flush>, optional.
+//
+// Replies to the client # of keys removed from redis state, including 0.
+//
+// Errors out if not called on the head, or if GcsMode is not
+// kCkptFlush/kFlushOnlyUnsafe.
+int HeadFlush_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
+                           int argc) {
+  const double start = Timer::NowMicrosecs();
+  if (!module.ActAsHead()) {
+    return RedisModule_ReplyWithError(
+        ctx, "ERR this command must be called on the head.");
+  }
+  if (!module.SupportsFlushing()) {
+    return RedisModule_ReplyWithError(
+        ctx, "ERR GcsMode indicates no flushing support");
+  }
+  if (argc > 2) return RedisModule_WrongArity(ctx);
+  long long max_num_entries_to_flush = 10000;  // Default.
+  if (argc == 2) {
+    RedisModule_StringToLongLong(argv[1], &max_num_entries_to_flush);
   }
 
   // Read watermarks from master.
@@ -778,16 +824,21 @@ int HeadFlush_RedisCommand(RedisModuleCtx* ctx, RedisModuleString** argv,
   // Additionally we take into account (1) reasonably-sized batch, (2) max
   // seqnum seen.
   // In summary, the eligible range is [sn_flushed, sn_bound).
-  const int64_t sn_bound = std::min(
-      module.sn() + 1, std::min(sn_flushed + kMaxEntriesToFlushOnce, sn_ckpt));
+  const int64_t sn_bound =
+      std::min(module.sn() + 1,
+               std::min(sn_flushed + max_num_entries_to_flush, sn_ckpt));
+  DLOG(INFO) << "module.sn() " << module.sn() << "; max_num_entries_to_flush "
+             << max_num_entries_to_flush << "; sn_bound " << sn_bound;
   std::vector<std::string> flushable_keys;
   CollectFlushableKeys(sn_flushed, sn_bound, sn_ckpt, &flushable_keys);
 
   // DoFlush() sends a reply to the client.
   int result = DoFlush(ctx, /*sn_left*/ sn_flushed, /*sn_right*/ sn_bound,
                        /*sn_ckpt*/ sn_ckpt, flushable_keys);
-  const double end = timer.NowMicrosecs();
-  LOG(INFO) << "HeadFlush took " << (end - start) / 1e3 << " ms";
+  const double end = Timer::NowMicrosecs();
+  DLOG(INFO) << "HeadFlush took " << (end - start) / 1e3 << " ms";
+  DLOG(INFO) << "sn_to_key size " << module.sn_to_key().size()
+             << "; key_to_sn size " << module.key_to_sn().size();
   return result;
 }
 
@@ -899,8 +950,8 @@ extern "C" {
 //   argv[1] indicates the MasterType: 0 for redis (default), 1 for etcd
 int RedisModule_OnLoad(RedisModuleCtx* ctx, RedisModuleString** argv,
                        int argc) {
-  FLAGS_logtostderr = 1;  // By default glog uses log files in /tmp.
-  ::google::InitGoogleLogging("libmember");
+  // FLAGS_logtostderr = 1;  // By default glog uses log files in /tmp.
+  // ::google::InitGoogleLogging("libmember");
 
   // Init.  Must be at the top.
   if (RedisModule_Init(ctx, "MEMBER", 1, REDISMODULE_APIVER_1) ==
@@ -909,7 +960,8 @@ int RedisModule_OnLoad(RedisModuleCtx* ctx, RedisModuleString** argv,
   }
 
   // Command parsing.
-  long long gcs_mode = 0;
+  long long gcs_mode = 3;
+  LOG(INFO) << "argc " << argc;
   if (argc > 0) {
     CHECK_EQ(REDISMODULE_OK, RedisModule_StringToLongLong(argv[0], &gcs_mode));
   }
@@ -1020,6 +1072,13 @@ int RedisModule_OnLoad(RedisModuleCtx* ctx, RedisModuleString** argv,
                                 /*keystep=*/0) == REDISMODULE_ERR) {
     return REDISMODULE_ERR;
   }
+  if (RedisModule_CreateCommand(ctx, "CONFIGURE_FLUSH_POLICY",
+                                ConfigureFlushPolicy_RedisCommand, "write",
+                                /*firstkey=*/-1, /*lastkey=*/-1,
+                                /*keystep=*/0) == REDISMODULE_ERR) {
+    return REDISMODULE_ERR;
+  }
+
   if (RedisModule_CreateCommand(ctx, "HEAD.FLUSH", HeadFlush_RedisCommand,
                                 "write",
                                 /*firstkey=*/-1, /*lastkey=*/-1,

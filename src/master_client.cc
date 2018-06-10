@@ -26,6 +26,9 @@ redisContext* SyncConnect(const std::string& address, int port) {
 
 Status RedisMasterClient::Connect(const std::string& address, int port) {
   redis_context_.reset(SyncConnect(address, port));
+  LOG(INFO) << "SyncConnect successful";
+  redis_context_.reset(SyncConnect(address, port));
+  LOG(INFO) << "SyncConnect successful";
   return Status::OK();
 }
 
